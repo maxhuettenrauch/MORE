@@ -3,6 +3,24 @@ import nlopt
 from types import SimpleNamespace
 
 
+def get_default_config(dim):
+    buffer_fac = 1.5
+    max_samples = int(np.ceil((buffer_fac * (1 + dim + int(dim * (dim + 1) / 2)))))
+    n_samples = int(4 + np.floor(3 * np.log(dim)))
+
+    config = {"epsilon": 0.5,
+              "gamma": 0.99,
+              "beta_0": 0.1,
+              "n_samples": n_samples,
+              "max_samples": max_samples,
+              "buffer_fac": buffer_fac,
+              "min_data_fraction": 0.5
+              }
+
+    return config
+
+
+
 class MORE:
     def __init__(self, dim, config_dict, logger=None):
 
@@ -51,13 +69,13 @@ class MORE:
         self._eta = 1
         self._omega = 1
         self._old_term = None
-        self.mu_p = None
-        self.chol_Sigma_p = None
         self._old_dist = None
         self._current_model = None
         self._dual = np.inf
         self._grad = np.zeros(2)
         self._kl = np.inf
+        self._kl_mean = np.inf
+        self._kl_cov = np.inf
         self._new_entropy = np.inf
         self._new_mean = None
         self._new_cov = None
@@ -76,17 +94,25 @@ class MORE:
         return beta
 
     def step(self, old_dist, surrogate):
+        """
+        Given an old distribution and a model object, perform one MORE iteration
+        :param old_dist: Distribution object
+        :param surrogate: quadratic model object
+        :return: new distribution parameters and success variables
+        """
+
+        success = False
 
         self.beta = self.get_beta(old_dist)  # set entropy constraint
-        self.eta_0 = self._eta
-        self.omega_0 = self._omega
+        # self.eta_0 = self._eta
+        # self.omega_0 = self._omega
 
         self._old_term = old_dist.log_det + old_dist.mean.T @ old_dist.nat_mean
         self._old_dist = old_dist
         self._current_model = surrogate
-        self.opt.set_lower_bounds((1e-20, 1e-20))
 
         for i in range(10):
+            self.opt.set_lower_bounds((1e-20, 1e-20))
             eta, omega, success = self.dual_opt()
 
             if success:
@@ -95,9 +121,13 @@ class MORE:
             self.eta_0 *= 2
 
         if success:
+            self.eta_0 = self._eta
+            self.omega_0 = self._omega
             return self._new_mean, self._new_cov, True
         else:
             # logger.debug("Optimization unsuccessful")
+            self.eta_0 = 10
+            self.omega_0 = 10
             return old_dist.mean, old_dist.cov, False
 
     def dual_opt(self):
@@ -107,7 +137,7 @@ class MORE:
             eta, omega = self.opt.optimize(np.hstack([self.eta_0, self.omega_0]))
             opt_val = self.opt.last_optimum_value()
             result = self.opt.last_optimize_result()
-        except (ValueError, RuntimeError, nlopt.ForcedStop, np.linalg.LinAlgError, nlopt.RoundoffLimited) as e:
+        except (RuntimeError, nlopt.ForcedStop, nlopt.RoundoffLimited) as e:
             # logger.debug(e)
             if (np.sqrt(self._grad[0] ** 2 + self._grad[1] ** 2) < self._grad_bound) or \
                     (self._eta < 1e-10 and np.abs(self._grad[1]) < self._grad_bound) or \
@@ -121,6 +151,15 @@ class MORE:
                 omega = 1
                 result = 5
                 opt_val = self._dual
+
+        except (ValueError, np.linalg.LinAlgError) as e:
+            self.logger.debug("Error in mean optimization: {}".format(e))
+            result = 5
+            opt_val = self._dual
+            eta = -1
+
+        except Exception as e:
+            raise e
 
         finally:
             if result in (1, 2, 3, 4) and ~np.isinf(opt_val):
@@ -190,10 +229,15 @@ class MORE:
             entropy = -np.inf
             new_mean = self._old_dist.mean
             new_cov = self._old_dist.cov
+            maha_dist = 0
+            trace_term = self.dim
+            new_log_det = self._old_dist.log_det
 
         self._dual = g
         self._grad = grad
         self._kl = kl
+        self._kl_mean = 0.5 * maha_dist
+        self._kl_cov = 0.5 * (trace_term + self._old_dist.log_det - new_log_det - self.dim)
         self._new_entropy = entropy
         self._new_mean = new_mean
         self._new_cov = new_cov
@@ -203,130 +247,191 @@ class MORE:
 # %%%%%%%%%%%%%%%%%%%%%%%%%% fmin function interfaces %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 
 
-# TODO: not working yet
-def fmin_ls(objective, x_start, init_sigma, n_iters, budget=None, debug=False):
-    from more.quad_model import QuadModelLS as QuadModel
+def fmin_ls(objective,
+            x_start,
+            init_sigma,
+            n_iters,
+            target_dist=1e-8,
+            algo_config: dict = {},
+            model_config: dict = {},
+            budget=None,
+            debug=False,
+            minimize=False):
+
+    from more.sample_db import SimpleSampleDatabase
+    from more.quad_model import default_config_ls, QuadModelLS
+    from more.gauss_full_cov import GaussFullCov
+    import attrdict as ad
     import logging
 
-    buffer_fac = 1.5
-    n = len(x_start)
-    pop_size = int(4 + np.floor(3 * np.log(n)))
-    max_samples = int(np.ceil((buffer_fac * (1 + n + int(n * (n + 1) / 2)))))
+    logging.basicConfig(level=logging.DEBUG if debug else logging.INFO)
+    logger = logging.getLogger('MORE')
+    if debug:
+        logger.setLevel("DEBUG")
+    else:
+        logger.setLevel("INFO")
 
-    model_options = {"max_samples": max_samples,
-                     "output_weighting": "rank",
-                     "whiten_input": True,
-                     "normalize_input": True,
-                     "normalize_output": "min_max",
-                     "ridge_factor": 1e-5,
-                     "refit": False,
-                     "diagonal_quad": False,
-                     "increase_complexity": True}
+    dim = len(x_start)
+    default_algo_config = get_default_config(dim)
+    default_algo_config.update(algo_config)
+    default_model_config = default_config_ls()
+    default_model_config.update(model_config)
 
-    optim_options = {"epsilon": 3,
-                     "include_current_mean": False,
-                     }
+    algo_config = ad.AttrDict(default_algo_config)
+    model_config = ad.AttrDict(default_model_config)
 
-    model = QuadModel(dim_x=n)
-    opt = _fmin(objective, x_start, init_sigma, budget, optim_options, QuadModel, model_options, debug)
-    return opt
+    sample_db = SimpleSampleDatabase(algo_config.max_samples)
 
+    search_dist = GaussFullCov(x_start, init_sigma * np.eye(dim))
+    surrogate = QuadModelLS(dim, model_config)
+    # surrogate = QuadModelSubBLR(dim, model_options_sub)
 
-def _fmin(objective, x_start, init_sigma, budget, optim_options, model_class, model_options, debug=False):
-    from more.models.sample_database import SimpleSampleDatabase
-    from more.gauss_full_cov import GaussFullCov
-    from collections import deque
+    more = MORE(dim, algo_config, logger=logger)
 
-    n = objective.dimension
-    x_start = np.reshape(x_start, [n, 1])  # 1 * np.random.randn(n, 1)
+    if budget is None:
+        budget = np.inf
+    it = 0
+    obj_evals = 0
+    dist_to_opt = 1e10
 
-    algo = MORE(objective=objective,
-                optim_kwargs=optim_options,
-                model_class=model_class,
-                model_kwargs=model_options,
-                logger=logger)
+    while dist_to_opt > target_dist and it < n_iters and obj_evals < budget:
+        logger.info("Iteration {}".format(it))
+        new_samples = search_dist.sample(algo_config.n_samples)
+        obj_evals += algo_config.n_samples
 
-    algo.debug = debug
+        new_rewards = objective(new_samples)
+        if minimize:
+            # negate, MORE maximizes, but we want to minimize
+            new_rewards = -new_rewards
 
-    sample_db = SimpleSampleDatabase(model_options.max_samples)
+        sample_db.add_data(new_samples, new_rewards)
 
-    pop_size = optim_options['n_samples']
-    i = 0
-    opt = objective(algo.search_dist.mean.flatten())
-
-    success_hist = deque(maxlen=(int(10 + np.ceil(30 * n / pop_size))))
-    opt_hist = deque(maxlen=(int(10 + np.ceil(30 * n / pop_size))))
-    mean_hist = deque(maxlen=(int(10 + np.ceil(30 * n / pop_size))))
-    opt_hist.append(opt)
-    # opts = []
-    # TODO: change to f val at opt or x
-
-    print("Starting optimization")
-    while not objective.final_target_hit and objective.evaluations < budget:
-        # logger.debug("----------iter {} -----------".format(i))
-
-        new_xs = algo.search_dist.sample(pop_size)
-        new_xs = np.atleast_2d(new_xs).T
-        new_ys = objective(new_xs)
-
-        sample_db.add_data(new_xs, new_ys)
-        xs, ys = sample_db.get_data()
-
-        # fit quadratic surrogate model
-        try:
-            succesful_fit = model.fit(samples, rews, old_dist, imp_weights)
-        except (np.linalg.LinAlgError, ValueError, RuntimeError):
-            succesful_fit = False
-
-        if not succesful_fit:
+        if len(sample_db.data_x) < algo_config.min_data_fraction * surrogate.model_dim:
             continue
 
-        success = algo.step(xs, -ys, None)
-        algo.iter += 1
+        samples, rewards = sample_db.get_data()
 
-        success_hist.append(success)
-        mean_hist.append(algo._success_mean)
+        success = surrogate.fit(samples, rewards, search_dist, )
+        if not success:
+            continue
 
-        # the CMA way
-        opt = np.min(ys)
-        # opts.append(opt)
+        new_mean, new_cov, success = more.step(search_dist, surrogate)
 
-        # # using the search dist mean
-        # opt = objective(algo.search_dist.mean.flatten())
-        #
-        # # using the mean of the current samples
-        # opt = np.mean(ys)
+        search_dist.update_params(new_mean, new_cov)
 
-        opt_hist.append(opt)
-        if len(success_hist) > 9:
-            if np.max(opt_hist) - np.min(opt_hist) < 1e-12 or np.mean(
-                    mean_hist) < 0.1 or algo.search_dist.condition_number > 1e12 or opt > 1e12 or algo.search_dist.entropy > 150:
-            # if np.max(opt_hist) - np.min(opt_hist) < 1e-12 or not any(success_hist) or algo.q.condition_number > 1e14:
-                print("Restart MORE")
-                pop_size = int(2 * algo.options.n_samples)
-                if pop_size >= algo.options.max_samples:
-                    algo.options.max_samples = pop_size
-                    algo.model_kwargs['max_samples'] = pop_size
-                    # algo.top_samples = int(0.75 * algo.options.max_samples) if 0.75 * algo.options.max_samples > 1.5 * algo.model.model_dim else int(1.5 * algo.model.model_dim)
-                    algo.options.top_samples = pop_size
+        lam = objective(search_dist.mean.T)
+        logger.debug("Loss at mean {}".format(lam))
+        logger.debug("Change KL cov {}, Change Entropy {}".format(more._kl_cov, more.beta))
+        logger.debug("Dist to x_opt {}".format(np.linalg.norm(objective._xopt - search_dist.mean.flatten())))
 
-                algo.reset(x_start=x_start,
-                           init_sigma=init_sigma,
-                           sample=False)
+        dist_to_opt = np.abs((objective._fopt - lam))
+        logger.debug("Dist to f_opt {}".format(dist_to_opt))
+        logger.debug("-------------------------------------------------------------------------------")
 
-                sample_db = SimpleSampleDatabase(model_options.max_samples)
+        if dist_to_opt < 1e-8:
+            break
 
-                success_hist = deque(maxlen=(int(10 + np.ceil(30 * n / pop_size))))
-                opt_hist = deque(maxlen=(int(10 + np.ceil(30 * n / pop_size))))
-                mean_hist = deque(maxlen=(int(10 + np.ceil(30 * n / pop_size))))
-                # new_success_hist.extend(success_hist)
-                # success_hist = new_success_hist
+        it += 1
 
-        i += 1
+    return dist_to_opt, search_dist.mean
 
-    if objective.final_target_hit:
-        print("Optimization hit final target successfully")
-    else:
-        print("not...")
 
-    return opt
+# TODO: not working yet
+# def _fmin(objective, x_start, init_sigma, budget, optim_options, model_class, model_options, debug=False):
+#     from more.models.sample_database import SimpleSampleDatabase
+#     from more.gauss_full_cov import GaussFullCov
+#     from collections import deque
+#
+#     n = objective.dimension
+#     x_start = np.reshape(x_start, [n, 1])  # 1 * np.random.randn(n, 1)
+#
+#     algo = MORE(objective=objective,
+#                 optim_kwargs=optim_options,
+#                 model_class=model_class,
+#                 model_kwargs=model_options,
+#                 logger=logger)
+#
+#     algo.debug = debug
+#
+#     sample_db = SimpleSampleDatabase(model_options.max_samples)
+#
+#     pop_size = optim_options['n_samples']
+#     i = 0
+#     opt = objective(algo.search_dist.mean.flatten())
+#
+#     success_hist = deque(maxlen=(int(10 + np.ceil(30 * n / pop_size))))
+#     opt_hist = deque(maxlen=(int(10 + np.ceil(30 * n / pop_size))))
+#     mean_hist = deque(maxlen=(int(10 + np.ceil(30 * n / pop_size))))
+#     opt_hist.append(opt)
+#     # opts = []
+#     # TODO: change to f val at opt or x
+#
+#     print("Starting optimization")
+#     while not objective.final_target_hit and objective.evaluations < budget:
+#         # logger.debug("----------iter {} -----------".format(i))
+#
+#         new_xs = algo.search_dist.sample(pop_size)
+#         new_xs = np.atleast_2d(new_xs).T
+#         new_ys = objective(new_xs)
+#
+#         sample_db.add_data(new_xs, new_ys)
+#         xs, ys = sample_db.get_data()
+#
+#         # fit quadratic surrogate model
+#         try:
+#             succesful_fit = model.fit(samples, rews, old_dist, imp_weights)
+#         except (np.linalg.LinAlgError, ValueError, RuntimeError):
+#             succesful_fit = False
+#
+#         if not succesful_fit:
+#             continue
+#
+#         success = algo.step(xs, -ys, None)
+#         algo.iter += 1
+#
+#         success_hist.append(success)
+#         mean_hist.append(algo._success_mean)
+#
+#         # the CMA way
+#         opt = np.min(ys)
+#         # opts.append(opt)
+#
+#         # # using the search dist mean
+#         # opt = objective(algo.search_dist.mean.flatten())
+#         #
+#         # # using the mean of the current samples
+#         # opt = np.mean(ys)
+#
+#         opt_hist.append(opt)
+#         if len(success_hist) > 9:
+#             if np.max(opt_hist) - np.min(opt_hist) < 1e-12 or np.mean(
+#                     mean_hist) < 0.1 or algo.search_dist.condition_number > 1e12 or opt > 1e12 or algo.search_dist.entropy > 150:
+#             # if np.max(opt_hist) - np.min(opt_hist) < 1e-12 or not any(success_hist) or algo.q.condition_number > 1e14:
+#                 print("Restart MORE")
+#                 pop_size = int(2 * algo.options.n_samples)
+#                 if pop_size >= algo.options.max_samples:
+#                     algo.options.max_samples = pop_size
+#                     algo.model_kwargs['max_samples'] = pop_size
+#                     # algo.top_samples = int(0.75 * algo.options.max_samples) if 0.75 * algo.options.max_samples > 1.5 * algo.model.model_dim else int(1.5 * algo.model.model_dim)
+#                     algo.options.top_samples = pop_size
+#
+#                 algo.reset(x_start=x_start,
+#                            init_sigma=init_sigma,
+#                            sample=False)
+#
+#                 sample_db = SimpleSampleDatabase(model_options.max_samples)
+#
+#                 success_hist = deque(maxlen=(int(10 + np.ceil(30 * n / pop_size))))
+#                 opt_hist = deque(maxlen=(int(10 + np.ceil(30 * n / pop_size))))
+#                 mean_hist = deque(maxlen=(int(10 + np.ceil(30 * n / pop_size))))
+#                 # new_success_hist.extend(success_hist)
+#                 # success_hist = new_success_hist
+#
+#         i += 1
+#
+#     if objective.final_target_hit:
+#         print("Optimization hit final target successfully")
+#     else:
+#         print("not...")
+#
+#     return opt

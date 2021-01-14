@@ -4,7 +4,7 @@ setup(
     name='MORE',
     version='',
     packages=['more'],
-    install_requires=['cma', 'numpy', 'nlopt'],
+    install_requires=['cma', 'numpy', 'nlopt', 'attrdict', 'joblib'],
     url='',
     license='',
     author='Maximilian Hüttenrauch',

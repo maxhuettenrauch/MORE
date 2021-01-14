@@ -1,5 +1,35 @@
 import numpy as np
 from types import SimpleNamespace
+from cma.evolution_strategy import RecombinationWeights
+from joblib import Parallel, delayed
+
+
+def default_config_ls():
+    config = {"output_weighting": "min_max",
+              "whiten_input": True,
+              "normalize_features": True,
+              "normalize_output": "mean_std",
+              "unnormalize_output": False,
+              "ridge_factor": 1e-12,
+              "limit_model_opt": True,
+              "refit": False,
+              "seed": None}
+
+    return config
+
+
+def default_config_ls_rank():
+    config = {"output_weighting": None,
+              "whiten_input": True,
+              "normalize_features": True,
+              "normalize_output": "rank",
+              "unnormalize_output": False,
+              "ridge_factor": 1e-12,
+              "limit_model_opt": True,
+              "refit": False,
+              "seed": None}
+
+    return config
 
 
 class MoreModel:
@@ -21,6 +51,14 @@ class MoreModel:
         self._a_quad = np.eye(self.n)
         self._a_lin = np.zeros(shape=(self.n, 1))
         self._a_0 = np.zeros(shape=(1, 1))
+
+    @property
+    def r(self):
+        return self._a_lin
+
+    @property
+    def R(self):
+        return self._a_quad
 
     def get_model_params(self):
         return self._a_quad, self._a_lin
@@ -59,18 +97,62 @@ class MoreModel:
         par[0] = par[0] - self._phi_mean @ par[1:]
         return par
 
+    def output_weighting(self, y):
+        output_weighting = self.options.output_weighting
+        if output_weighting is None or not output_weighting:
+            weighting = np.ones(shape=(y.size, 1))
+        elif output_weighting == "rank":
+            cma_weights = RecombinationWeights(y.size * 2)
+            cma_weights.finalize_negative_weights(cmu=1, dimension=y.size * 2, c1=1)
+            ind = np.argsort(y.flatten())
+            weighting = np.zeros(shape=y.shape)
+            weighting[ind] = cma_weights.positive_weights[::-1, None]
+        elif output_weighting == "min_max":
+            weighting = (y - np.min(y)) / (np.max(y) - np.min(y))
+        elif output_weighting == "linear":
+            ind = np.argsort(y.flatten())
+            weighting = np.zeros(shape=y.shape)
+            weighting[ind] = np.linspace(0, 20, num=y.size)[:, None]
+        else:
+            raise NotImplementedError
+
+        return weighting / np.sum(weighting)
+
     def normalize_output(self, y):
-        self.data_y_org = y
-        data_y_mean = np.mean(y)
-        data_y_std = np.std(y, ddof=1)
-        # if self.y_std == 0:
-        #     return False
-        y = (y - data_y_mean) / data_y_std
+        norm_type = self.options.normalize_output
+        if norm_type == "mean_std":
+            data_y_mean = np.mean(y)
+            data_y_std = np.std(y, ddof=1)
+            self._data_y_mean = data_y_mean
+            new_y = (y - data_y_mean) / data_y_std
 
-        self._data_y_mean = data_y_mean
-        self._data_y_std = data_y_std
+        elif norm_type == "mean_std_clipped":
+            ind = np.argsort(y, axis=0)[int((1 - self.options.top_data_fraction) * len(y)):]
+            top_data_y_mean = np.mean(y[ind])
+            top_data_y_std = np.std(y[ind])
+            new_y = (y - top_data_y_mean) / top_data_y_std
+            new_y[new_y < self.options.min_clip_value] = self.options.min_clip_value
 
-        return y
+        elif norm_type == "min_max":
+            new_y = (y - np.min(y)) / (np.max(y) - np.min(y))
+
+        elif norm_type == "rank_linear":
+            ind = np.argsort(y.flatten())
+            new_y = np.zeros(shape=y.shape)
+            new_y[ind] = np.linspace(0, 1, num=y.size)[:, None]
+
+        elif norm_type == "rank_cma":
+            cma_weights = RecombinationWeights(2 * y.size)[0:y.size]
+            ind = np.argsort(y.flatten())
+            new_y = np.zeros(shape=y.shape)
+            new_y[ind] = ((cma_weights - np.min(cma_weights)) / (np.max(cma_weights) - np.min(cma_weights)))[::-1,
+                           None]
+        elif norm_type is None or not norm_type:
+            new_y = y
+        else:
+            raise NotImplementedError
+
+        return new_y
 
     def unnormalize_output(self, a_quad, a_lin, a_0):
         norm_type = self.options.normalize_output
@@ -159,12 +241,14 @@ class QuadModelLS(MoreModel):
         if len(data_y.shape) < 2:
             data_y = data_y[:, None]
 
+        data_y_org = np.copy(data_y)
+
         if imp_weights is None:
-            imp_weights = np.ones(data_y.shape)
+            imp_weights = np.ones(data_y_org.shape)
 
-        self.data_y_std = np.std(data_y, ddof=1)
+        self._data_y_std = np.std(data_y_org, ddof=1)
 
-        if self.data_y_std == 0:
+        if self._data_y_std == 0:
             return False
 
         if self.options.whiten_input:
@@ -178,10 +262,9 @@ class QuadModelLS(MoreModel):
         if self.options.normalize_features:
             self.normalize_features(phi)
 
-        if self.options.normalize_output:
-            data_y = self.normalize_output(data_y)
+        data_y = self.normalize_output(data_y_org)
 
-        weights = np.ones_like(data_y)  # may weight with absolute values of reward
+        weights = self.output_weighting(data_y_org, )
 
         self.targets = data_y
         self.phi = phi
@@ -211,9 +294,6 @@ class QuadModelLS(MoreModel):
         return a_quad, a_lin, a_0
 
     def fit(self, data_x, data_y, dist=None):
-        if len(data_x) < 0.5 * self.model_dim:
-            return False
-
         success = self.preprocess_data(data_x, data_y, dist)
         if not success:
             return False
@@ -225,10 +305,18 @@ class QuadModelLS(MoreModel):
 
         phi_t_phi = phi_weighted.T @ self.phi
 
-        if self.options.ridge_factor is not None:
-            par = np.linalg.solve(phi_t_phi + self.options.ridge_factor * reg_mat, phi_weighted.T @ self.targets)
+        par = np.linalg.solve(phi_t_phi + self.options.ridge_factor * reg_mat, phi_weighted.T @ self.targets)
 
         a_quad, a_lin, a_0 = self.postprocess_params(par)
+
+        if self.options.limit_model_opt:
+            try:
+                model_opt = np.linalg.solve(a_quad, a_lin)
+            except:
+                model_opt = np.zeros_like(a_lin)
+
+            if np.any(np.abs(model_opt) > 20):
+                return False
 
         self._a_quad = a_quad
         self._a_lin = a_lin
@@ -246,12 +334,14 @@ class QuadModelSubBLR(MoreModel):
         self.tau_squared = 100
         self.sigma_squared = 100
         self.sub_space_dim = 5
-        self.k = 500
+        self.k = 1000
 
         self.model_dim_lin = 1 + self.sub_space_dim
         self.model_dim_diag = self.model_dim_lin + self.sub_space_dim
         self.dim_tri = int(self.sub_space_dim * (self.sub_space_dim + 1) / 2)
         self.model_dim_full = 1 + self.sub_space_dim + self.dim_tri
+
+        self.model_dim = 1 + self.sub_space_dim + self.dim_tri
 
         self.beta_prior_prec = 1 / self.tau_squared * np.eye(self.model_dim_full)
         # self.beta_prior_prec[0, 0] = 1e-10
@@ -287,7 +377,7 @@ class QuadModelSubBLR(MoreModel):
         chol_cov = np.linalg.cholesky(cov_p_d_w)
         log_det = 2 * np.sum(np.log(np.diag(chol_cov)))
 
-        quad_term_half = np.linalg.solve(np.linalg.cholesky(cov_p_d_w), self.data_y)
+        quad_term_half = np.linalg.solve(chol_cov, self.data_y)
 
         likelihood = -0.5 * (log_det + quad_term_half.T @ quad_term_half + len(self.data_y) * np.log(2 * np.pi))
 
@@ -295,6 +385,32 @@ class QuadModelSubBLR(MoreModel):
             return likelihood.flatten()
         else:
             return np.exp(likelihood).flatten()
+
+    def create_sub_space_model(self, _):
+        w = np.random.randn(self.n, self.sub_space_dim)
+
+        phi = self.poly_feat(self.data_x @ w)
+        if self.options.normalize_features:
+            self.normalize_features(phi)
+
+        mu_beta = self.beta_post(phi)
+
+        if self.options.normalize_features:
+            mu_beta[1:] = mu_beta[1:] / self._phi_std.T
+            mu_beta[0] = mu_beta[0] - self._phi_mean @ mu_beta[1:]
+
+        p_d_w_i_log = self.p_d_w(phi, log=True)
+
+        a_0 = mu_beta[0]
+
+        a_lin = mu_beta[1:self.sub_space_dim + 1]
+
+        a_quad_sub = np.zeros((self.sub_space_dim, self.sub_space_dim))
+        a_tri = mu_beta[self.sub_space_dim + 1:].flatten()
+        a_quad_sub[self.square_feat_lower_tri_ind] = a_tri
+        a_quad_sub = 1 / 2 * (a_quad_sub + a_quad_sub.T)
+
+        return w, p_d_w_i_log, a_0, a_lin, a_quad_sub
 
     def fit(self, data_x, data_y, dist=None, imp_weights=None, objective=None):
 
@@ -304,52 +420,61 @@ class QuadModelSubBLR(MoreModel):
         if self._data_y_std == 0:
             return False
 
+        # data_y_org = np.copy(data_y)
+        # data_y = self.normalize_output(data_y_org)
+
         self.data_x = data_x
         self.data_y = data_y
         self.weights = 1 / np.abs(data_y)
 
-        mu_beta_all = []
-        p_d_w_all = []
-        p_d_w_all_log = []
-        w_all = []
-        a_0_all = []
-        a_lin_all = []
-        a_quad_sub_all = []
+        # mu_beta_all = []
+        # p_d_w_all = []
+        # p_d_w_all_log = []
+        # w_all = []
+        # a_0_all = []
+        # a_lin_all = []
+        # a_quad_sub_all = []
+        #
+        # for i in range(self.k):
+        #     w = np.random.randn(self.n, self.sub_space_dim)
+        #     w_all.append(w)
+        #
+        #     phi = self.poly_feat(self.data_x @ w)
+        #     if self.options.normalize_features:
+        #         self.normalize_features(phi)
+        #
+        #     mu_beta = self.beta_post(phi)
+        #
+        #     if self.options.normalize_features:
+        #         mu_beta[1:] = mu_beta[1:] / self._phi_std.T
+        #         mu_beta[0] = mu_beta[0] - self._phi_mean @ mu_beta[1:]
+        #
+        #     mu_beta_all.append(mu_beta)
+        #
+        #     p_d_w_i = self.p_d_w(phi, log=False)
+        #     p_d_w_i_log = self.p_d_w(phi, log=True)
+        #
+        #     p_d_w_all.append(p_d_w_i)
+        #     p_d_w_all_log.append(p_d_w_i_log)
+        #
+        #     a_0 = mu_beta[0]
+        #
+        #     a_lin = mu_beta[1:self.sub_space_dim + 1]
+        #
+        #     a_quad_sub = np.zeros((self.sub_space_dim, self.sub_space_dim))
+        #     a_tri = mu_beta[self.sub_space_dim + 1:].flatten()
+        #     a_quad_sub[self.square_feat_lower_tri_ind] = a_tri
+        #     a_quad_sub = 1 / 2 * (a_quad_sub + a_quad_sub.T)
+        #
+        #     a_0_all.append(a_0)
+        #     a_lin_all.append(a_lin)
+        #     a_quad_sub_all.append(a_quad_sub)
 
-        for i in range(self.k):
-            w = np.random.randn(self.n, self.sub_space_dim)
-            w_all.append(w)
+        # pool = mp.Pool(8)
+        # w_all, p_d_w_all_log, a_0_all, a_lin_all, a_quad_sub_all = zip(*pool.map(self.create_sub_space_model, [[]] * self.k))
+        # pool.close()
 
-            phi = self.poly_feat(self.data_x @ w)
-            if self.options.normalize_features:
-                self.normalize_features(phi)
-
-            mu_beta = self.beta_post(phi)
-
-            if self.options.normalize_features:
-                mu_beta[1:] = mu_beta[1:] / self._phi_std.T
-                mu_beta[0] = mu_beta[0] - self._phi_mean @ mu_beta[1:]
-
-            mu_beta_all.append(mu_beta)
-
-            p_d_w_i = self.p_d_w(phi, log=False)
-            p_d_w_i_log = self.p_d_w(phi, log=True)
-
-            p_d_w_all.append(p_d_w_i)
-            p_d_w_all_log.append(p_d_w_i_log)
-
-            a_0 = mu_beta[0]
-
-            a_lin = mu_beta[1:self.sub_space_dim + 1]
-
-            a_quad_sub = np.zeros((self.sub_space_dim, self.sub_space_dim))
-            a_tri = mu_beta[self.sub_space_dim + 1:].flatten()
-            a_quad_sub[self.square_feat_lower_tri_ind] = a_tri
-            a_quad_sub = 1 / 2 * (a_quad_sub + a_quad_sub.T)
-
-            a_0_all.append(a_0)
-            a_lin_all.append(a_lin)
-            a_quad_sub_all.append(a_quad_sub)
+        w_all, p_d_w_all_log, a_0_all, a_lin_all, a_quad_sub_all = zip(*Parallel(n_jobs=8)(delayed(self.create_sub_space_model)(i) for i in range(self.k)))
 
         p_max = np.max(p_d_w_all_log)
         exp = [np.exp(p - p_max) for p in p_d_w_all_log]
