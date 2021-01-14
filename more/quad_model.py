@@ -109,6 +109,8 @@ class MoreModel:
             weighting[ind] = cma_weights.positive_weights[::-1, None]
         elif output_weighting == "min_max":
             weighting = (y - np.min(y)) / (np.max(y) - np.min(y))
+        elif output_weighting == "inverse":
+            weighting = 1 / (np.abs(y) + 1e-2)
         elif output_weighting == "linear":
             ind = np.argsort(y.flatten())
             weighting = np.zeros(shape=y.shape)
@@ -116,7 +118,7 @@ class MoreModel:
         else:
             raise NotImplementedError
 
-        return weighting / np.sum(weighting)
+        return weighting
 
     def normalize_output(self, y):
         norm_type = self.options.normalize_output
