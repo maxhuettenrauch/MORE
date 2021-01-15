@@ -153,7 +153,7 @@ class MORE:
                 opt_val = self._dual
 
         except (ValueError, np.linalg.LinAlgError) as e:
-            self.logger.debug("Error in mean optimization: {}".format(e))
+            # self.logger.debug("Error in mean optimization: {}".format(e))
             result = 5
             opt_val = self._dual
             eta = -1
@@ -173,8 +173,8 @@ class MORE:
                     if self._new_entropy > 1.1 * self.beta:
                         success_entropy = True
 
-        self.logger.debug("epsilon = {}, beta = {}".format(self.epsilon, self.beta))
-        self.logger.debug("eta = {}, omega = {}".format(eta, omega))
+        # self.logger.debug("epsilon = {}, beta = {}".format(self.epsilon, self.beta))
+        # self.logger.debug("eta = {}, omega = {}".format(eta, omega))
         success = success_kl and success_entropy
 
         return eta, omega, success
