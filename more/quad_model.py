@@ -110,7 +110,7 @@ class MoreModel:
         elif output_weighting == "min_max":
             weighting = (y - np.min(y)) / (np.max(y) - np.min(y))
         elif output_weighting == "inverse":
-            weighting = 1 / (np.abs(y) + 1e-2)
+            weighting = 1 / (np.abs(y) + 1)
         elif output_weighting == "linear":
             ind = np.argsort(y.flatten())
             weighting = np.zeros(shape=y.shape)
