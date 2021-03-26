@@ -1,11 +1,12 @@
 import numpy as np
+from gym.utils import seeding
 
 
 class GaussFullCov:
-    def __init__(self, mean: np.array, cov: np.array):
-        self.dim = mean.shape[-1]
+    def __init__(self, mean: np.array, cov: np.array, npr=None):
         if len(mean.shape) < 2:
             mean = np.atleast_2d(mean).reshape([-1, 1])
+        self.dim = mean.shape[0]
         self.mean = mean
         self.cov = cov
 
@@ -18,6 +19,11 @@ class GaussFullCov:
         self.condition_number = None
 
         self.update_params(mean, cov)
+
+        if npr is None:
+            self.npr, self.seed = seeding.np_random()
+        else:
+            self.npr = npr
 
         # a count for sample reuse with database
         self.count = 0
@@ -50,7 +56,7 @@ class GaussFullCov:
     # only call these methods after calling update_params
 
     def sample(self, n_samples, row_vec=True):
-        z = np.random.randn(self.dim, n_samples)
+        z = self.npr.normal(size=(n_samples, self.dim)).T
         x = self.mean + self.chol_cov @ z
         if row_vec:
             x = x.T

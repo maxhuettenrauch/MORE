@@ -8,6 +8,10 @@ class SimpleSampleDatabase:
         self.data_x = deque(maxlen=size)
         self.data_y = deque(maxlen=size)
 
+    @property
+    def buffer_size(self):
+        return len(self.data_y)
+
     def add_data(self, data_x, data_y):
         self.data_x.extend(data_x)
         self.data_y.extend(data_y)
