@@ -441,6 +441,15 @@ class QuadModelSubBLR(MoreModel):
         self._a_lin = np.zeros(shape=(self.n, 1))
         self._a_0 = np.zeros(shape=(1, 1))
 
+    def poly_feat(self, data_x):
+        lin_feat = data_x
+        quad_feat = np.transpose((data_x[:, :, None] @ data_x[:, None, :]),
+                                 [1, 2, 0])[self.square_feat_lower_tri_ind].T
+
+        phi = np.hstack([np.ones([data_x.shape[0], 1]), lin_feat, quad_feat])
+
+        return phi
+
     def beta_post(self, phi):
         phi_weighted = phi * self.weights
 
