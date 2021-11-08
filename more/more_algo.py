@@ -20,8 +20,20 @@ def get_default_config(dim):
     return config
 
 
-
 class MORE:
+    @classmethod
+    def get_default_config(cls):
+
+        more_config = {"epsilon": 0.5,
+                       "gamma": 0.99,
+                       "beta_0": 0.1,
+                       "h_0": -200,
+                       "eta_0": 10,
+                       "omega_0": 10,
+                       }
+
+        return more_config
+
     def __init__(self, dim, config_dict, logger=None):
 
         self.debug = False
@@ -33,9 +45,9 @@ class MORE:
         self.beta_0 = self.options.beta_0
         self.gamma = self.options.gamma
         self.epsilon = self.options.epsilon
-        self.eta_0 = 10
-        self.omega_0 = 10
-        self.h_0 = -200  # minimum entropy of the search distribution
+        self.eta_0 = self.options.eta_0
+        self.omega_0 = self.options.omega_0
+        self.h_0 = self.options.h_0  # minimum entropy of the search distribution
 
         # Setting up optimizer
         opt = nlopt.opt(nlopt.LD_LBFGS, 2)
@@ -47,7 +59,7 @@ class MORE:
         opt.set_ftol_rel(1e-12)
         opt.set_xtol_abs(1e-12)
         opt.set_xtol_rel(1e-12)
-        opt.set_maxeval(10000)
+        opt.set_maxeval(1000)
         opt.set_maxtime(5 * 60 * 60)
 
         def opt_func(x, grad):
@@ -119,6 +131,7 @@ class MORE:
                 break
 
             self.eta_0 *= 2
+            self.omega_0 *= 2
 
         if success:
             self.eta_0 = self._eta
@@ -126,8 +139,8 @@ class MORE:
             return self._new_mean, self._new_cov, True
         else:
             # logger.debug("Optimization unsuccessful")
-            self.eta_0 = 10
-            self.omega_0 = 10
+            self.eta_0 = self.options.eta_0
+            self.omega_0 = self.options.omega_0
             return old_dist.mean, old_dist.cov, False
 
     def dual_opt(self):
@@ -147,8 +160,8 @@ class MORE:
                 result = 1
                 opt_val = self._dual
             else:
-                eta = 10000
-                omega = 1
+                eta = -1
+                omega = -1
                 result = 5
                 opt_val = self._dual
 
@@ -157,6 +170,7 @@ class MORE:
             result = 5
             opt_val = self._dual
             eta = -1
+            omega = -1
 
         except Exception as e:
             raise e
@@ -239,6 +253,7 @@ class MORE:
         self._kl_mean = 0.5 * maha_dist
         self._kl_cov = 0.5 * (trace_term + self._old_dist.log_det - new_log_det - self.dim)
         self._new_entropy = entropy
+        self._entropy_diff = self._old_dist.entropy - entropy
         self._new_mean = new_mean
         self._new_cov = new_cov
         return g

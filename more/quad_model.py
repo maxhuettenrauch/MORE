@@ -79,23 +79,10 @@ class MoreModel:
 
     def poly_feat(self, data_x):
         lin_feat = data_x
-        if self.options.increase_complexity:
-            if self.current_complexity == "lin":
-                phi = np.hstack([np.ones([data_x.shape[0], 1]), lin_feat])
-            elif self.current_complexity == "diag":
-                quad_feat = lin_feat ** 2
-                phi = np.hstack([np.ones([data_x.shape[0], 1]), lin_feat, quad_feat])
-            elif self.current_complexity == "full":
-                quad_feat = np.transpose((data_x[:, :, None] @ data_x[:, None, :]),
-                                         [1, 2, 0])[self.square_feat_lower_tri_ind].T
-                phi = np.hstack([np.ones([data_x.shape[0], 1]), lin_feat, quad_feat])
-            else:
-                raise ValueError("Unrecognized model type")
-        else:
-            quad_feat = np.transpose((data_x[:, :, None] @ data_x[:, None, :]),
-                                     [1, 2, 0])[self.square_feat_lower_tri_ind].T
+        quad_feat = np.transpose((data_x[:, :, None] @ data_x[:, None, :]),
+                                 [1, 2, 0])[self.square_feat_lower_tri_ind].T
 
-            phi = np.hstack([np.ones([data_x.shape[0], 1]), lin_feat, quad_feat])
+        phi = np.hstack([np.ones([data_x.shape[0], 1]), lin_feat, quad_feat])
 
         return phi
 
@@ -115,31 +102,6 @@ class MoreModel:
         par[0] = par[0] - self._phi_mean @ par[1:]
         return par
 
-    def output_weighting(self, y):
-        output_weighting = self.options.output_weighting
-        if output_weighting is None or not output_weighting:
-            weighting = np.ones(shape=(y.size, 1))
-        elif output_weighting == "rank":
-            cma_weights = RecombinationWeights(y.size * 2)
-            cma_weights.finalize_negative_weights(cmu=1, dimension=y.size * 2, c1=1)
-            ind = np.argsort(y.flatten())
-            weighting = np.zeros(shape=y.shape)
-            weighting[ind] = cma_weights.positive_weights[::-1, None]
-        elif output_weighting == "min_max":
-            weighting = (y - np.min(y)) / (np.max(y) - np.min(y))
-        elif output_weighting == "inverse":
-            weighting = 1 / (np.abs(y) + 1)
-        elif output_weighting == "linear":
-            ind = np.argsort(y.flatten())
-            weighting = np.zeros(shape=y.shape)
-            weighting[ind] = np.linspace(0, 20, num=y.size)[:, None]
-        elif output_weighting == "linear":
-            weighting = np.linspace(0, 20, num=y.size)[:, None] + 1e-6
-        else:
-            raise NotImplementedError
-
-        return weighting
-
     def normalize_output(self, y):
         norm_type = self.options.normalize_output
         if norm_type == "mean_std":
@@ -148,28 +110,6 @@ class MoreModel:
             self._data_y_mean = data_y_mean
             new_y = (y - data_y_mean) / data_y_std
 
-        elif norm_type == "mean_std_clipped":
-            ind = np.argsort(y, axis=0)[int((1 - self.options.top_data_fraction) * len(y)):]
-            top_y = y[ind[:, 0]]
-            top_data_y_mean = np.mean(top_y)
-            top_data_y_std = np.std(top_y)
-            new_y = (y - top_data_y_mean) / top_data_y_std
-            new_y[new_y < self.options.min_clip_value] = self.options.min_clip_value
-
-        elif norm_type == "min_max":
-            new_y = (y - np.min(y)) / (np.max(y) - np.min(y))
-
-        elif norm_type == "rank_linear":
-            ind = np.argsort(y.flatten())
-            new_y = np.zeros(shape=y.shape)
-            new_y[ind] = np.linspace(-3, 3, num=y.size)[:, None]
-
-        elif norm_type == "rank_cma":
-            cma_weights = RecombinationWeights(2 * y.size)[0:y.size]
-            ind = np.argsort(y.flatten())
-            new_y = np.zeros(shape=y.shape)
-            new_y[ind] = ((cma_weights - np.min(cma_weights)) / (np.max(cma_weights) - np.min(cma_weights)))[::-1,
-                           None]
         elif norm_type is None or not norm_type:
             new_y = y
         else:
@@ -184,10 +124,6 @@ class MoreModel:
             new_a_quad = self._data_y_std * a_quad
             new_a_lin = self._data_y_std * a_lin
             new_a_0 = self._data_y_std * a_0 + self._data_y_mean
-        elif norm_type == "min_max":
-            new_a_quad = (self.data_y_max - self.data_y_min) * a_quad
-            new_a_lin = (self.data_y_max - self.data_y_min) * a_lin
-            new_a_0 = (self.data_y_max - self.data_y_min) * a_0 + self.data_y_min
         else:
             return a_quad, a_lin, a_0
 
@@ -214,8 +150,8 @@ class MoreModel:
     def unwhiten_params(self, a_quad, a_lin, a_0):
         int_a_quad = self._data_x_inv_std @ a_quad @ self._data_x_inv_std.T
         int_a_lin = self._data_x_inv_std @ a_lin
-        a_quad = - 2 * int_a_quad  # to achieve -1/2 xMx + xm form
-        a_lin = - 2 * (self._data_x_mean @ int_a_quad).T + int_a_lin
+        a_quad = int_a_quad  # to achieve -1/2 xMx + xm form
+        a_lin = (self._data_x_mean @ int_a_quad).T + int_a_lin
         a_0 = a_0 + self._data_x_mean @ (int_a_quad @ self._data_x_mean.T - int_a_lin)
 
         return a_quad, a_lin, a_0
@@ -241,20 +177,29 @@ class MoreModel:
 
 
 class QuadModelLS(MoreModel):
+    @classmethod
+    def get_default_config(cls):
+        config = {
+                  "whiten_input": True,
+                  "normalize_features": True,
+                  "normalize_output": "mean_std",
+                  "unnormalize_output": False,
+                  "ridge_factor": 1e-10,
+                  "seed": None,
+                  "min_data_frac": 1.1,
+                  "use_prior": True,
+                  "limit_model_opt": True,
+                  "model_limit": 200,
+                  "refit_pos_def": False
+                  }
+
+        return config
+
     def __init__(self, dim, config_dict):
         super().__init__(dim, config_dict)
 
         self.dim_tri = int(self.n * (self.n + 1) / 2)
-
-        if self.options.increase_complexity:
-            self.model_dim_lin = 1 + self.n
-            self.model_dim_diag = self.model_dim_lin + self.n
-            self.model_dim_full = 1 + self.n + self.dim_tri
-            self.model_dim = self.model_dim_lin
-            self.current_complexity = "lin"
-        else:
-            self.model_dim = 1 + self.n + self.dim_tri
-            self.current_complexity = "full"
+        self.model_dim = 1 + self.n + self.dim_tri
 
         self.model_params = np.zeros(self.model_dim)
         self.square_feat_lower_tri_ind = np.tril_indices(self.n)
@@ -271,11 +216,6 @@ class QuadModelLS(MoreModel):
         self.prior = np.hstack([np.zeros(1 + self.n), - 1 / np.sqrt(2 * self.n) * np.eye(self.n)[self.square_feat_lower_tri_ind]])[:, None]
 
     def preprocess_data(self, data_x, data_y, dist, imp_weights=None):
-        if self.options.increase_complexity:
-            sufficient_data = self.update_complexity(data_x)
-            if not sufficient_data:
-                return False
-
         if len(data_y.shape) < 2:
             data_y = data_y[:, None]
 
@@ -302,11 +242,8 @@ class QuadModelLS(MoreModel):
 
         data_y = self.normalize_output(data_y)
 
-        weights = self.output_weighting(data_y, )
-
         self.targets = data_y
         self.phi = phi
-        self.weights = weights
 
         return True
 
@@ -314,78 +251,37 @@ class QuadModelLS(MoreModel):
         if self.options.normalize_features:
             par = self.denormalize_features(par)
 
-        if self.current_complexity == "lin":
-            a_quad = np.zeros(shape=(self.n, self.n))
-        elif self.current_complexity == "diag":
-            a_quad = np.diag(par[self.n + 1:].flatten())
-        elif self.current_complexity == "full":
-            a_quad = np.zeros((self.n, self.n))
-            a_tri = par[self.n + 1:].flatten()
-            a_quad[self.square_feat_lower_tri_ind] = a_tri
-            a_quad = 1 / 2 * (a_quad + a_quad.T)
-        else:
-            raise ValueError("Unrecognized model type")
+        a_quad = np.zeros((self.n, self.n))
+        a_tri = par[self.n + 1:].flatten()
+        a_quad[self.square_feat_lower_tri_ind] = a_tri
+        a_quad = - (a_quad + a_quad.T)
 
         a_0 = par[0]
         a_lin = par[1:self.n + 1]
-        # a_quad = np.zeros((self.n, self.n))
-        # a_tri = par[self.n + 1:].flatten()
-        # a_quad[self.square_feat_lower_tri_ind] = a_tri
-        # a_quad = 1 / 2 * (a_quad + a_quad.T)
 
         if self.options.whiten_input:
             a_quad, a_lin, a_0 = self.unwhiten_params(a_quad, a_lin, a_0)
-            if self.current_complexity == 'lin':
-                # a_quad = np.eye(self.n)
-                a_quad = np.zeros(shape=(self.n, self.n))
-        else:
-            a_quad = - 2 * a_quad
 
         if self.options.unnormalize_output:
             a_quad, a_lin, a_0 = self.unnormalize_output(a_quad, a_lin, a_0)
 
         return a_quad, a_lin, a_0
 
-    def update_complexity(self, data_x):
-        if self.options.increase_complexity:
-            if len(data_x) < self.options.min_data_frac * self.model_dim_lin:
-                return False
-            elif len(data_x) < self.options.min_data_frac * self.model_dim_diag:
-                self.current_complexity = "lin"
-                self.model_dim = self.model_dim_lin
-                self.prior = np.zeros((1 + self.n, 1))
-                return True
-            elif self.options.min_data_frac * self.model_dim_diag <= len(
-                    data_x) < self.options.min_data_frac * self.model_dim_full:
-                self.current_complexity = "diag"
-                self.model_dim = self.model_dim_diag
-                self.prior = np.hstack([np.zeros(1 + self.n), - 1 / np.sqrt(2 * self.n) * np.ones(self.n)])[:, None]
-                return True
-            else:
-                self.current_complexity = "full"
-                self.model_dim = self.model_dim_full
-                self.prior = np.hstack(
-                    [np.zeros(1 + self.n), - 1 / np.sqrt(2 * self.n) * np.eye(self.n)[self.square_feat_lower_tri_ind]])[
-                             :, None]
-                return True
-
     def fit(self, data_x, data_y, dist=None):
         success = self.preprocess_data(data_x, data_y, dist)
         if not success:
             return False
 
-        phi_weighted = self.phi * self.weights
-
         reg_mat = np.eye(self.model_dim)
         reg_mat[0, 0] = 0
 
-        phi_t_phi = phi_weighted.T @ self.phi
+        phi_t_phi = self.phi.T @ self.phi
 
         if self.options.use_prior:
             par = np.linalg.solve(phi_t_phi + self.options.ridge_factor * reg_mat,
-                                  phi_weighted.T @ self.targets + self.options.ridge_factor * reg_mat @ self.prior)
+                                  self.phi.T @ self.targets + self.options.ridge_factor * reg_mat @ self.prior)
         else:
-            par = np.linalg.solve(phi_t_phi + self.options.ridge_factor * reg_mat, phi_weighted.T @ self.targets)
+            par = np.linalg.solve(phi_t_phi + self.options.ridge_factor * reg_mat, self.phi.T @ self.targets)
 
         self._par = par
 
