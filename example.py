@@ -1,6 +1,6 @@
 import numpy as np
 from more.gauss_full_cov import GaussFullCov
-from more.quad_model import QuadModelLS, QuadModelSubBLR
+from more.quad_model import QuadModelSubBLR
 from more.more_algo import MORE
 from more.sample_db import SimpleSampleDatabase
 from cma.bbobbenchmarks import nfreefunclasses
@@ -27,44 +27,18 @@ if __name__ == "__main__":
                          "normalize_output": None,  # "mean_std",  # "mean_std_clipped",  # "rank", "mean_std", "min_max",
                          }
 
-    # buffer_fac = 1.5
-    # max_samples = int(np.ceil((buffer_fac * (1 + dim + int(dim * (dim + 1) / 2)))))
-    # samples_per_iter = int(4 + np.floor(3 * np.log(dim)))
-
-    # model_options_ls = {"max_samples": max_samples,
-    #                     "output_weighting": "rank",  # "rank",
-    #                     "whiten_input": True,
-    #                     "normalize_features": True,
-    #                     "normalize_output": "mean_std_clipped",  # "mean_std",  # "rank", "mean_std", "min_max",
-    #                     "top_data_fraction": 0.5,
-    #                     "min_clip_value": -3.,
-    #                     "unnormalize_output": False,  # "rank",
-    #                     "ridge_factor": 1e-12,
-    #                     "limit_model_opt": True,
-    #                     "refit": False,
-    #                     "buffer_fac": buffer_fac,
-    #                     "seed": None}
-
-    more_config = {"epsilon": kl_bound,
-                   "gamma": gamma,
-                   "beta_0": entropy_loss_bound,
-                   "n_samples": samples_per_iter,
-                   "max_samples": max_samples,
-                   # "buffer_fac": buffer_fac,
-                   "min_data_fraction": 0.5
-                   }
-
-    x_start = 0.5 * np.random.randn(dim)
-    init_sigma = 1
+    more_config = MORE.get_default_config()
 
     # borrowing Rosenbrock from the cma package
-    objective = nfreefunclasses[5](0, zerof=True, zerox=True)
+    objective = nfreefunclasses[7](0, zerof=True, zerox=True)
     objective.initwithsize(curshape=(1, dim), dim=dim)
 
     sample_db = SimpleSampleDatabase(max_samples)
 
-    search_dist = GaussFullCov(x_start, init_sigma * np.eye(dim))
-    # surrogate = QuadModelLS(dim, model_options_ls)
+    x_start = objective.x_opt + 0.1 * np.random.randn(dim)
+    init_sigma = 1
+
+    search_dist = GaussFullCov(x_start, init_sigma ** 2 * np.eye(dim))
     surrogate = QuadModelSubBLR(dim, model_options_sub)
 
     more = MORE(dim, more_config, logger=logger)
@@ -82,7 +56,7 @@ if __name__ == "__main__":
 
         samples, rewards = sample_db.get_data()
 
-        success = surrogate.fit(samples, rewards, search_dist, )
+        success = surrogate.update_quad_model(samples, rewards, search_dist, )
         if not success:
             continue
 

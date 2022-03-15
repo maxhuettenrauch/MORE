@@ -50,6 +50,8 @@ class GaussFullCov:
         vecs = np.real(eig_vecs)
         sqrt_l = np.sqrt(lambdas)
         # self.Q = vecs @ np.diag(lambdas ** -1) @ vecs.T
+        self.eig_vals = eig_vals
+        self.eig_vecs = eig_vecs
         self.sqrt_prec = vecs @ np.diag(sqrt_l ** -1) @ vecs.T
         self.condition_number = np.abs(np.max(lambdas) / np.min(lambdas))
 

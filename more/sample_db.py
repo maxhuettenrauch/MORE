@@ -3,6 +3,15 @@ import numpy as np
 
 
 class SimpleSampleDatabase:
+    @classmethod
+    def get_default_config(cls, dim, buffer_fac=1.5):
+        max_samples = int(np.maximum(np.ceil((buffer_fac * (1 + dim + int(dim * (dim + 1) / 2)))), (dim + 1) * 8))
+
+        buffer_config = {"buffer_fac": buffer_fac,
+                         "max_samples": max_samples,
+                         }
+        return buffer_config
+
     def __init__(self, size):
         self.size = size
         self.data_x = deque(maxlen=size)

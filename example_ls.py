@@ -30,7 +30,7 @@ if __name__ == "__main__":
     objective = nfreefunclasses[7](0, zerof=True, zerox=False)
     objective.initwithsize(curshape=(1, dim), dim=dim)
 
-    search_dist = GaussFullCov(x_start, init_sigma * np.eye(dim))
+    search_dist = GaussFullCov(x_start, init_sigma ** 2 * np.eye(dim))
     surrogate = QuadModelLS(dim, model_options_ls)
 
     more = MORE(dim, more_config, logger=logger)
@@ -44,7 +44,7 @@ if __name__ == "__main__":
             # negate, MORE maximizes, but we want to minimize
             rewards = -rewards
 
-        success = surrogate.fit(samples, rewards, search_dist, )
+        success = surrogate.update_quad_model(samples, rewards, search_dist, )
         if not success:
             continue
 

@@ -1,40 +1,7 @@
 import numpy as np
 from types import SimpleNamespace
-from cma.evolution_strategy import RecombinationWeights
+import scipy.stats as sst
 from joblib import Parallel, delayed
-
-
-def default_config_ls():
-    config = {"output_weighting": "min_max",
-              "whiten_input": True,
-              "normalize_features": True,
-              "normalize_output": "mean_std",
-              "unnormalize_output": False,
-              "ridge_factor": 1e-12,
-              "limit_model_opt": True,
-              "refit": False,
-              "seed": None,
-              "increase_complexity": False,
-              "min_data_frac": 1.5,
-              "use_prior": True,
-              "model_limit": 20
-              }
-
-    return config
-
-
-def default_config_ls_rank():
-    config = {"output_weighting": None,
-              "whiten_input": True,
-              "normalize_features": True,
-              "normalize_output": "rank",
-              "unnormalize_output": False,
-              "ridge_factor": 1e-12,
-              "limit_model_opt": True,
-              "refit": False,
-              "seed": None}
-
-    return config
 
 
 class MoreModel:
@@ -50,12 +17,30 @@ class MoreModel:
         self._data_y_mean = None
         self._data_y_std = None
 
+        self._phi_mean = None
+        self._phi_std = None
+
         self.data_y_min = None
         self.data_y_max = None
 
         self._a_quad = np.eye(self.n)
         self._a_lin = np.zeros(shape=(self.n, 1))
         self._a_0 = np.zeros(shape=(1, 1))
+
+        self.model_dim = None
+        self.prior = None
+
+        self.phi = None
+        self.targets = None
+        self.weights = None
+
+        self.square_feat_lower_tri_ind = np.tril_indices(self.n)
+        self._par = None
+        self._last_model_opt = None
+
+    @property
+    def r_0(self):
+        return self._a_0
 
     @property
     def r(self):
@@ -68,20 +53,122 @@ class MoreModel:
     def get_model_params(self):
         return self._a_quad, self._a_lin
 
-    def fit(self, data_x, data_y, **fit_args):
-        raise NotImplementedError("has to be implemented in subclass")
-
-    def preprocess_data(self, data_x, data_y, dist, **kwargs):
+    def update_quad_model(self, data_x, data_y, dist=None):
         raise NotImplementedError
 
-    def postprocess_params(self, params):
-        raise NotImplementedError
+    def limit_model_opt(self):
+        if self.options.limit_model_opt:
+            try:
+                model_opt = np.linalg.solve(self._a_quad, self._a_lin)
+                if self._last_model_opt is not None:
+                    valid = (np.linalg.norm(model_opt - self._last_model_opt) < self.options.model_limit_diff) and \
+                            (np.all(np.abs(model_opt) < self.options.model_limit))
+                else:
+                    valid = True
+                self._last_model_opt = model_opt
+            except:
+                # model_opt = np.zeros_like(self._a_lin)
+                valid = True
+
+            # return np.all(np.abs(model_opt) < self.options.model_limit)
+            return valid
+        else:
+            return True
+
+    def fit(self):
+        phi_weighted = self.phi * self.weights
+
+        # res = np.linalg.lstsq(phi_weighted, self.targets)
+        #
+        # par = res[0]
+
+        reg_mat = np.eye(self.model_dim)
+        reg_mat[0, 0] = 0
+
+        phi_t_phi = phi_weighted.T @ self.phi
+
+        if self.options.use_prior:
+            par = np.linalg.solve(phi_t_phi + self.options.ridge_factor * reg_mat,
+                                  phi_weighted.T @ self.targets + self.options.ridge_factor * reg_mat @ self.prior)
+        else:
+            par = np.linalg.solve(phi_t_phi + self.options.ridge_factor * reg_mat,
+                                  phi_weighted.T @ self.targets)
+
+        self._par = par
+
+        return True
+
+    def preprocess_data(self, data_x, data_y, dist, imp_weights=None):
+        if len(data_y.shape) < 2:
+            data_y = data_y[:, None]
+
+        self._data_y_std = np.std(data_y, ddof=1)
+        self._data_y_mean = np.mean(data_y)
+
+        if self._data_y_std == 0:
+            return False
+
+        self.data_y_org = np.copy(data_y)
+
+        weights = self.output_weighting(data_y, )
+
+        try:
+            data_y = self.normalize_output(data_y)
+        except ValueError:
+            return False
+
+        if imp_weights is None:
+            imp_weights = np.ones(data_y.shape)
+
+        if self.options.whiten_input:
+            data_x = self.whiten_input(data_x, dist)
+        else:
+            self.data_x_mean = np.zeros((1, self.n))
+            self.data_x_inv_std = np.eye(self.n)
+
+        phi = self.poly_feat(data_x)
+
+        if self.options.normalize_features:
+            self.normalize_features(phi)
+
+        # weights = self.output_weighting(data_y, )
+
+        self.targets = data_y
+        self.phi = phi
+        self.weights = weights * imp_weights
+
+        return True
+
+    def postprocess_params(self):
+        if self.options.normalize_features:
+            par = self.denormalize_features(self._par)
+        else:
+            par = self._par
+
+        a_quad = np.zeros((self.n, self.n))
+        a_tri = par[self.n + 1:].flatten()
+        a_quad[self.square_feat_lower_tri_ind] = a_tri
+        # a_quad = 1 / 2 * (a_quad + a_quad.T)
+        a_quad = - (a_quad + a_quad.T)
+
+        a_0 = par[0]
+        a_lin = par[1:self.n + 1]
+
+        if self.options.whiten_input:
+            self._whitened_a_quad = a_quad
+            self._whitened_a_lin = a_lin
+            a_quad, a_lin, a_0 = self.unwhiten_params(a_quad, a_lin, a_0)
+
+        if self.options.unnormalize_output:
+            a_quad, a_lin, a_0 = self.unnormalize_output(a_quad, a_lin, a_0)
+
+        return a_quad, a_lin, a_0
 
     def poly_feat(self, data_x):
         lin_feat = data_x
+
         quad_feat = np.transpose((data_x[:, :, None] @ data_x[:, None, :]),
                                  [1, 2, 0])[self.square_feat_lower_tri_ind].T
-
         phi = np.hstack([np.ones([data_x.shape[0], 1]), lin_feat, quad_feat])
 
         return phi
@@ -102,6 +189,36 @@ class MoreModel:
         par[0] = par[0] - self._phi_mean @ par[1:]
         return par
 
+    def output_weighting(self, y):
+        output_weighting = self.options.output_weighting
+        if output_weighting is None or not output_weighting:
+            weighting = np.ones(shape=(y.size, 1))
+
+        return weighting
+
+    def normalize_robust(self, y):
+        data_y_mean = np.mean(y)
+        data_y_std = np.std(y, ddof=1)
+        self._data_normalizer *= data_y_std
+        # self._data_y_mean = data_y_mean
+        new_y = (y - data_y_mean) / data_y_std
+        new_y[new_y < -3] = -3
+        new_y[new_y > 3] = 3
+        idx = (-3 < new_y) & (new_y < 3)
+        y_tmp = new_y[idx, None]
+
+        if sst.kurtosis(y_tmp) > 0.55 and not np.isclose(data_y_std, 1):
+            new_y[idx, None] = self.normalize_robust(y_tmp)
+        # elif sst.kurtosis(y_tmp) < 0:
+        #     new_y_tmp = np.linspace(np.min(new_y[idx]), np.max(new_y[idx]), num=y.size)[:, None]
+        #     new_y[idx] = np.zeros(shape=y_tmp.shape)
+        #     ind = np.argsort(y_tmp.flatten())
+        #     new_y[ind] = new_y_tmp
+            # return new_y
+        new_y[new_y == -3] = np.min(new_y[idx])
+        new_y[new_y == 3] = np.max(new_y[idx])
+        return new_y
+
     def normalize_output(self, y):
         norm_type = self.options.normalize_output
         if norm_type == "mean_std":
@@ -109,6 +226,9 @@ class MoreModel:
             data_y_std = np.std(y, ddof=1)
             self._data_y_mean = data_y_mean
             new_y = (y - data_y_mean) / data_y_std
+
+        elif norm_type == "mean_std_robust_recursive":
+            new_y = self.normalize_robust(y)
 
         elif norm_type is None or not norm_type:
             new_y = y
@@ -131,6 +251,9 @@ class MoreModel:
 
     def whiten_input(self, x, dist):
         data_x_mean = np.mean(x, axis=0, keepdims=True)
+        self.data_x_org = x
+        self._data_x_mean = data_x_mean
+        # data_x_inv_std = dist.sqrt_prec
 
         try:
             data_x_inv_std = np.linalg.inv(np.linalg.cholesky(np.cov(x, rowvar=False))).T
@@ -139,12 +262,10 @@ class MoreModel:
         finally:
             if np.any(np.isnan(data_x_inv_std)):
                 data_x_inv_std = dist.sqrt_prec
-
-        self.data_x_org = x
-        self._data_x_mean = data_x_mean
         self._data_x_inv_std = data_x_inv_std
         x = x - data_x_mean
         x = x @ data_x_inv_std
+
         return x
 
     def unwhiten_params(self, a_quad, a_lin, a_0):
@@ -156,41 +277,22 @@ class MoreModel:
 
         return a_quad, a_lin, a_0
 
-    def refit_pos_def(self, data_x, data_y, M, weights):
-        w, v = np.linalg.eig(M)
-        w[w > 0.0] = -1e-8
-        M = v @ np.diag(np.real(w)) @ v.T
-
-        # refit quadratic
-        aux = data_y - np.einsum('nk,kh,nh->n', data_x, M, data_x)[:, None]
-        lin_feat = data_x
-        phi = np.hstack([np.ones([data_x.shape[0], 1]), lin_feat])
-
-        phi_weighted = phi * weights
-
-        phi_t_phi = phi_weighted.T @ phi
-
-        par = np.linalg.solve(phi_t_phi + self.options.ridge_factor * np.eye(self.n + 1),
-                              phi_weighted.T @ aux)
-
-        return par
-
 
 class QuadModelLS(MoreModel):
     @classmethod
     def get_default_config(cls):
-        config = {
+        config = {"output_weighting": None,
                   "whiten_input": True,
                   "normalize_features": True,
                   "normalize_output": "mean_std",
                   "unnormalize_output": False,
-                  "ridge_factor": 1e-10,
+                  "ridge_factor": 1e-8,
                   "seed": None,
                   "min_data_frac": 1.1,
                   "use_prior": True,
                   "limit_model_opt": True,
-                  "model_limit": 200,
-                  "refit_pos_def": False
+                  "model_limit": 20,
+                  "model_limit_diff": 20,
                   }
 
         return config
@@ -199,110 +301,46 @@ class QuadModelLS(MoreModel):
         super().__init__(dim, config_dict)
 
         self.dim_tri = int(self.n * (self.n + 1) / 2)
+
         self.model_dim = 1 + self.n + self.dim_tri
 
         self.model_params = np.zeros(self.model_dim)
-        self.square_feat_lower_tri_ind = np.tril_indices(self.n)
+        self._model_opt = np.zeros(shape=(self.n, 1))
 
         self._phi_mean = np.zeros(shape=(1, self.model_dim - 1))
         self._phi_std = np.ones(shape=(1, self.model_dim - 1))
 
         self.ridge_factor = self.options.ridge_factor
 
-        self.phi = None
-        self.targets = None
-        self.weights = None
-
         self.prior = np.hstack([np.zeros(1 + self.n), - 1 / np.sqrt(2 * self.n) * np.eye(self.n)[self.square_feat_lower_tri_ind]])[:, None]
 
-    def preprocess_data(self, data_x, data_y, dist, imp_weights=None):
-        if len(data_y.shape) < 2:
-            data_y = data_y[:, None]
-
-        self.data_y_org = np.copy(data_y)
-
-        if imp_weights is None:
-            imp_weights = np.ones(data_y.shape)
-
-        self._data_y_std = np.std(data_y, ddof=1)
-
-        if self._data_y_std == 0:
+    def update_quad_model(self, data_x, data_y, dist=None):
+        # TODO: Should this be in here?
+        if len(data_x) < self.options.min_data_frac * self.model_dim:
             return False
 
-        if self.options.whiten_input:
-            data_x = self.whiten_input(data_x, dist)
-        else:
-            self.data_x_mean = np.zeros((1, self.n))
-            self.data_x_inv_std = np.eye(self.n)
+        self._data_normalizer = 1
 
-        phi = self.poly_feat(data_x)
-
-        if self.options.normalize_features:
-            self.normalize_features(phi)
-
-        data_y = self.normalize_output(data_y)
-
-        self.targets = data_y
-        self.phi = phi
-
-        return True
-
-    def postprocess_params(self, par):
-        if self.options.normalize_features:
-            par = self.denormalize_features(par)
-
-        a_quad = np.zeros((self.n, self.n))
-        a_tri = par[self.n + 1:].flatten()
-        a_quad[self.square_feat_lower_tri_ind] = a_tri
-        a_quad = - (a_quad + a_quad.T)
-
-        a_0 = par[0]
-        a_lin = par[1:self.n + 1]
-
-        if self.options.whiten_input:
-            a_quad, a_lin, a_0 = self.unwhiten_params(a_quad, a_lin, a_0)
-
-        if self.options.unnormalize_output:
-            a_quad, a_lin, a_0 = self.unnormalize_output(a_quad, a_lin, a_0)
-
-        return a_quad, a_lin, a_0
-
-    def fit(self, data_x, data_y, dist=None):
         success = self.preprocess_data(data_x, data_y, dist)
         if not success:
             return False
 
-        reg_mat = np.eye(self.model_dim)
-        reg_mat[0, 0] = 0
+        success = self.fit()
+        if not success:
+            return False
 
-        phi_t_phi = self.phi.T @ self.phi
-
-        if self.options.use_prior:
-            par = np.linalg.solve(phi_t_phi + self.options.ridge_factor * reg_mat,
-                                  self.phi.T @ self.targets + self.options.ridge_factor * reg_mat @ self.prior)
-        else:
-            par = np.linalg.solve(phi_t_phi + self.options.ridge_factor * reg_mat, self.phi.T @ self.targets)
-
-        self._par = par
-
-        a_quad, a_lin, a_0 = self.postprocess_params(par)
-
-        if self.options.limit_model_opt:
-            try:
-                model_opt = np.linalg.solve(a_quad, a_lin)
-            except:
-                model_opt = np.zeros_like(a_lin)
-
-            if np.any(np.abs(model_opt) > self.options.model_limit):
-                return False
+        a_quad, a_lin, a_0 = self.postprocess_params()
 
         self._a_quad = a_quad
         self._a_lin = a_lin
         self._a_0 = a_0
-
         self.model_params = np.vstack([a_quad[self.square_feat_lower_tri_ind][:, None], a_lin, a_0])
 
-        return True
+        # self._model_opt = np.linalg.solve(self._a_quad, self._a_lin)
+
+        success = self.limit_model_opt()
+
+        return success
 
 
 class QuadModelSubBLR(MoreModel):
@@ -399,7 +437,7 @@ class QuadModelSubBLR(MoreModel):
 
         return w, p_d_w_i_log, a_0, a_lin, a_quad_sub
 
-    def fit(self, data_x, data_y, dist=None, imp_weights=None, objective=None):
+    def update_quad_model(self, data_x, data_y, dist=None, imp_weights=None, objective=None):
 
         if len(data_x) < 0.1 * self.model_dim_full:
             return False

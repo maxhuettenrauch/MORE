@@ -2,35 +2,27 @@ import numpy as np
 import nlopt
 from types import SimpleNamespace
 
-
-def get_default_config(dim):
-    buffer_fac = 1.5
-    max_samples = int(np.ceil((buffer_fac * (1 + dim + int(dim * (dim + 1) / 2)))))
-    n_samples = int(4 + np.floor(3 * np.log(dim)))
-
-    config = {"epsilon": 0.5,
-              "gamma": 0.99,
-              "beta_0": 0.1,
-              "n_samples": n_samples,
-              "max_samples": max_samples,
-              "buffer_fac": buffer_fac,
-              "min_data_fraction": 0.5
-              }
-
-    return config
+from more.quad_model import QuadModelLS
 
 
 class MORE:
     @classmethod
-    def get_default_config(cls):
+    def get_default_config(cls, dim=None):
 
         more_config = {"epsilon": 0.5,
-                       "gamma": 0.99,
+                       "gamma": -0.99,
                        "beta_0": 0.1,
                        "h_0": -200,
-                       "eta_0": 10,
-                       "omega_0": 10,
+                       "eta_0": 1,
+                       "omega_0": 1,
                        }
+
+        if dim is not None:
+            samples_per_iter = int(4 + np.floor(3 * np.log(dim)))
+
+            more_config.update({"samples_per_iter": samples_per_iter,
+                                "h_0": -25 * dim
+                                })
 
         return more_config
 
@@ -102,7 +94,10 @@ class MORE:
         if self.gamma > 0:
             beta = self.gamma * (old_dist.entropy - self.h_0) + self.h_0
         else:
-            beta = old_dist.entropy - self.beta_0
+            if old_dist.entropy > self.h_0:
+                beta = old_dist.entropy - self.beta_0
+            else:
+                beta = self.h_0
         return beta
 
     def step(self, old_dist, surrogate):
@@ -262,19 +257,20 @@ class MORE:
 # %%%%%%%%%%%%%%%%%%%%%%%%%% fmin function interfaces %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 
 
-def fmin_ls(objective,
-            x_start,
-            init_sigma,
-            n_iters,
-            target_dist=1e-8,
-            algo_config: dict = {},
-            model_config: dict = {},
-            budget=None,
-            debug=False,
-            minimize=False):
+def fmin(objective,
+         x_start,
+         init_sigma,
+         n_iters,
+         target_dist=1e-8,
+         algo_config: dict = {},
+         model_config: dict = {},
+         sample_db_config: dict = {},
+         budget=None,
+         debug=False,
+         minimize=False):
 
     from more.sample_db import SimpleSampleDatabase
-    from more.quad_model import default_config_ls, QuadModelLS
+    from more.quad_model import QuadModelLS
     from more.gauss_full_cov import GaussFullCov
     import attrdict as ad
     import logging
@@ -287,19 +283,21 @@ def fmin_ls(objective,
         logger.setLevel("INFO")
 
     dim = len(x_start)
-    default_algo_config = get_default_config(dim)
+    default_algo_config = MORE.get_default_config(dim)
     default_algo_config.update(algo_config)
-    default_model_config = default_config_ls()
+    default_model_config = QuadModelLS.get_default_config()
     default_model_config.update(model_config)
+    default_sample_db_config = SimpleSampleDatabase.get_default_config(dim)
+    default_sample_db_config.update(sample_db_config)
 
     algo_config = ad.AttrDict(default_algo_config)
     model_config = ad.AttrDict(default_model_config)
+    sample_db_config = ad.AttrDict(default_sample_db_config)
 
-    sample_db = SimpleSampleDatabase(algo_config.max_samples)
+    sample_db = SimpleSampleDatabase(sample_db_config.max_samples)
 
     search_dist = GaussFullCov(x_start, init_sigma * np.eye(dim))
     surrogate = QuadModelLS(dim, model_config)
-    # surrogate = QuadModelSubBLR(dim, model_options_sub)
 
     more = MORE(dim, algo_config, logger=logger)
 
@@ -311,8 +309,8 @@ def fmin_ls(objective,
 
     while dist_to_opt > target_dist and it < n_iters and obj_evals < budget:
         logger.info("Iteration {}".format(it))
-        new_samples = search_dist.sample(algo_config.n_samples)
-        obj_evals += algo_config.n_samples
+        new_samples = search_dist.sample(algo_config.samples_per_iter)
+        obj_evals += algo_config.samples_per_iter
 
         new_rewards = objective(new_samples)
         if minimize:
@@ -321,12 +319,12 @@ def fmin_ls(objective,
 
         sample_db.add_data(new_samples, new_rewards)
 
-        if len(sample_db.data_x) < algo_config.min_data_fraction * surrogate.model_dim:
+        if len(sample_db.data_x) < model_config.min_data_frac * surrogate.model_dim:
             continue
 
         samples, rewards = sample_db.get_data()
 
-        success = surrogate.fit(samples, rewards, search_dist, )
+        success = surrogate.update_quad_model(samples, rewards, search_dist, )
         if not success:
             continue
 
@@ -349,104 +347,3 @@ def fmin_ls(objective,
         it += 1
 
     return dist_to_opt, search_dist.mean
-
-
-# TODO: not working yet
-# def _fmin(objective, x_start, init_sigma, budget, optim_options, model_class, model_options, debug=False):
-#     from more.models.sample_database import SimpleSampleDatabase
-#     from more.gauss_full_cov import GaussFullCov
-#     from collections import deque
-#
-#     n = objective.dimension
-#     x_start = np.reshape(x_start, [n, 1])  # 1 * np.random.randn(n, 1)
-#
-#     algo = MORE(objective=objective,
-#                 optim_kwargs=optim_options,
-#                 model_class=model_class,
-#                 model_kwargs=model_options,
-#                 logger=logger)
-#
-#     algo.debug = debug
-#
-#     sample_db = SimpleSampleDatabase(model_options.max_samples)
-#
-#     pop_size = optim_options['n_samples']
-#     i = 0
-#     opt = objective(algo.search_dist.mean.flatten())
-#
-#     success_hist = deque(maxlen=(int(10 + np.ceil(30 * n / pop_size))))
-#     opt_hist = deque(maxlen=(int(10 + np.ceil(30 * n / pop_size))))
-#     mean_hist = deque(maxlen=(int(10 + np.ceil(30 * n / pop_size))))
-#     opt_hist.append(opt)
-#     # opts = []
-#     # TODO: change to f val at opt or x
-#
-#     print("Starting optimization")
-#     while not objective.final_target_hit and objective.evaluations < budget:
-#         # logger.debug("----------iter {} -----------".format(i))
-#
-#         new_xs = algo.search_dist.sample(pop_size)
-#         new_xs = np.atleast_2d(new_xs).T
-#         new_ys = objective(new_xs)
-#
-#         sample_db.add_data(new_xs, new_ys)
-#         xs, ys = sample_db.get_data()
-#
-#         # fit quadratic surrogate model
-#         try:
-#             succesful_fit = model.fit(samples, rews, old_dist, imp_weights)
-#         except (np.linalg.LinAlgError, ValueError, RuntimeError):
-#             succesful_fit = False
-#
-#         if not succesful_fit:
-#             continue
-#
-#         success = algo.step(xs, -ys, None)
-#         algo.iter += 1
-#
-#         success_hist.append(success)
-#         mean_hist.append(algo._success_mean)
-#
-#         # the CMA way
-#         opt = np.min(ys)
-#         # opts.append(opt)
-#
-#         # # using the search dist mean
-#         # opt = objective(algo.search_dist.mean.flatten())
-#         #
-#         # # using the mean of the current samples
-#         # opt = np.mean(ys)
-#
-#         opt_hist.append(opt)
-#         if len(success_hist) > 9:
-#             if np.max(opt_hist) - np.min(opt_hist) < 1e-12 or np.mean(
-#                     mean_hist) < 0.1 or algo.search_dist.condition_number > 1e12 or opt > 1e12 or algo.search_dist.entropy > 150:
-#             # if np.max(opt_hist) - np.min(opt_hist) < 1e-12 or not any(success_hist) or algo.q.condition_number > 1e14:
-#                 print("Restart MORE")
-#                 pop_size = int(2 * algo.options.n_samples)
-#                 if pop_size >= algo.options.max_samples:
-#                     algo.options.max_samples = pop_size
-#                     algo.model_kwargs['max_samples'] = pop_size
-#                     # algo.top_samples = int(0.75 * algo.options.max_samples) if 0.75 * algo.options.max_samples > 1.5 * algo.model.model_dim else int(1.5 * algo.model.model_dim)
-#                     algo.options.top_samples = pop_size
-#
-#                 algo.reset(x_start=x_start,
-#                            init_sigma=init_sigma,
-#                            sample=False)
-#
-#                 sample_db = SimpleSampleDatabase(model_options.max_samples)
-#
-#                 success_hist = deque(maxlen=(int(10 + np.ceil(30 * n / pop_size))))
-#                 opt_hist = deque(maxlen=(int(10 + np.ceil(30 * n / pop_size))))
-#                 mean_hist = deque(maxlen=(int(10 + np.ceil(30 * n / pop_size))))
-#                 # new_success_hist.extend(success_hist)
-#                 # success_hist = new_success_hist
-#
-#         i += 1
-#
-#     if objective.final_target_hit:
-#         print("Optimization hit final target successfully")
-#     else:
-#         print("not...")
-#
-#     return opt
